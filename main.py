@@ -9,8 +9,9 @@ import math
 from mediapipe.python.solutions import holistic as mp_holistic
 
 # ─── Constantes ────────────────────────────────────────────────────────────────
-THRESHOLD     = 0.08
-DEBOUNCE_SECS = 0.5
+THRESHOLD       = 0.08
+HEART_THRESHOLD = 0.15
+DEBOUNCE_SECS   = 0.5
 
 COLOR_OK    = (80, 220, 0)
 COLOR_WARN  = (0, 165, 255)
@@ -18,11 +19,13 @@ COLOR_ALERT = (0, 0, 230)
 COLOR_BOX   = (0, 215, 255)
 COLOR_MOUTH = (255, 255, 0)
 COLOR_TIP   = (200, 80, 255)
+COLOR_HEART = (147, 20, 255)  # Rosa / Magenta vibrante
 FONT        = cv2.FONT_HERSHEY_SIMPLEX
 
 # ─── Estado compartilhado entre threads ───────────────────────────────────────
 shared = {
     "is_alert": False,
+    "is_heart": False,
     "frame":    None,
     "lock":     threading.Lock(),
 }
@@ -61,6 +64,80 @@ def overlay_text(img, lines, sy=28, fs=0.5):
 
 def dist(p1, p2):
     return math.sqrt((p1.x - p2.x)**2 + (p1.y - p2.y)**2)
+
+def detect_heart_gesture(left_hand_lms, right_hand_lms):
+    """Detecta se as duas mãos juntas estão formando o gesto de coração."""
+    if left_hand_lms is None or right_hand_lms is None:
+        return False, None
+
+    lh = left_hand_lms.landmark
+    rh = right_hand_lms.landmark
+
+    # Index 8 (Indicador) e Index 4 (Polegar)
+    d_index = dist(lh[8], rh[8])
+    d_thumb = dist(lh[4], rh[4])
+
+    if d_index < HEART_THRESHOLD and d_thumb < HEART_THRESHOLD:
+        cx_norm = (lh[8].x + rh[8].x + lh[4].x + rh[4].x) / 4.0
+        cy_norm = (lh[8].y + rh[8].y + lh[4].y + rh[4].y) / 4.0
+        return True, (cx_norm, cy_norm)
+
+    return False, None
+
+def get_heart_points(cx, cy, scale):
+    """Gera lista de pontos (x, y) de um coração paramétrico."""
+    pts = []
+    steps = 60
+    for i in range(steps):
+        t = 2 * math.pi * i / steps
+        # Equação paramétrica do coração
+        x = 16 * (math.sin(t) ** 3)
+        y = -(13 * math.cos(t) - 5 * math.cos(2*t) - 2 * math.cos(3*t) - math.cos(4*t))
+        px = int(cx + x * scale)
+        py = int(cy + y * scale)
+        pts.append([px, py])
+    return np.array(pts, dtype=np.int32)
+
+import numpy as np
+
+def draw_giant_heart(img, center_px, now):
+    """Desenha um coração gigante animado com brilho e efeito pulsante no frame OpenCV."""
+    h, w = img.shape[:2]
+    cx, cy = center_px
+
+    # Pulsação suave (heartbeat)
+    pulse = 1.0 + 0.12 * math.sin(now * 7.0)
+    base_scale = min(w, h) / 38.0 * pulse
+
+    # Overlay para transparência e brilho
+    overlay = img.copy()
+
+    # 1. Glow externo (coração maior translúcido)
+    pts_glow = get_heart_points(cx, cy, base_scale * 1.25)
+    cv2.fillPoly(overlay, [pts_glow], (255, 80, 200))
+
+    # 2. Coração principal preenchido
+    pts_main = get_heart_points(cx, cy, base_scale)
+    cv2.fillPoly(overlay, [pts_main], (147, 20, 255))
+
+    # 3. Contorno brilhante
+    cv2.polylines(overlay, [pts_main], True, (255, 200, 255), 3, cv2.LINE_AA)
+
+    # 4. Núcleo interno destacado
+    pts_inner = get_heart_points(cx, cy, base_scale * 0.55)
+    cv2.fillPoly(overlay, [pts_inner], (200, 100, 255))
+
+    # Aplica transparência
+    alpha = 0.70 + 0.15 * math.sin(now * 7.0)
+    cv2.addWeighted(overlay, alpha, img, 1.0 - alpha, 0, img)
+
+    # Texto comemorativo sobre o coração
+    msg = "💖 CORACÃO DETECTADO! 💖"
+    (tw, th), _ = cv2.getTextSize(msg, FONT, 0.85, 2)
+    tx, ty = (w - tw) // 2, max(40, cy - int(base_scale * 16))
+    cv2.putText(img, msg, (tx+2, ty+2), FONT, 0.85, (0, 0, 0), 3, cv2.LINE_AA)
+    cv2.putText(img, msg, (tx, ty), FONT, 0.85, (255, 180, 255), 2, cv2.LINE_AA)
+
 
 # ─── Thread de visão ──────────────────────────────────────────────────────────
 
@@ -140,6 +217,28 @@ def vision_thread():
                 cv2.circle(frame, close_tip_px, 10, COLOR_TIP, 2)
                 cv2.line(frame, mouth_px, close_tip_px, COLOR_TIP, 1)
 
+            # ── Detecção de gesto: Coração com duas mãos ──────────────────────
+            is_heart, center_norm = detect_heart_gesture(
+                results.left_hand_landmarks, results.right_hand_landmarks
+            )
+            shared["is_heart"] = is_heart
+
+            if is_heart and center_norm:
+                cx_px = int(center_norm[0] * w)
+                cy_px = int(center_norm[1] * h)
+
+                # Desenha ligações sutis entre os indicadores e polegares das duas mãos
+                lh8 = lm_to_px(results.left_hand_landmarks.landmark[8], w, h)
+                rh8 = lm_to_px(results.right_hand_landmarks.landmark[8], w, h)
+                lh4 = lm_to_px(results.left_hand_landmarks.landmark[4], w, h)
+                rh4 = lm_to_px(results.right_hand_landmarks.landmark[4], w, h)
+
+                cv2.line(frame, lh8, rh8, COLOR_HEART, 2)
+                cv2.line(frame, lh4, rh4, COLOR_HEART, 2)
+
+                # Desenha o coração gigante no centro do gesto no frame da câmera
+                draw_giant_heart(frame, (cx_px, cy_px), now)
+
             # ── Debounce ──────────────────────────────────────────────────────
             if hand_near_mouth:
                 if hand_on_mouth_start is None:
@@ -162,8 +261,10 @@ def vision_thread():
 
             # ── HUD / overlay de alerta ────────────────────────────────────────
             status = "ALERTA!" if shared["is_alert"] else \
+                     "CORAÇÃO 💖" if is_heart else \
                      "Mao perto" if hand_near_mouth else "OK"
             sc = COLOR_ALERT if shared["is_alert"] else \
+                 COLOR_HEART if is_heart else \
                  COLOR_WARN  if hand_near_mouth else COLOR_OK
 
             cv2.rectangle(frame, (0,0), (w,5), sc, -1)
@@ -184,6 +285,7 @@ def vision_thread():
                 f"Face:    {'SIM' if results.face_landmarks else 'NAO'}",
                 f"Mao esq: {'SIM' if results.left_hand_landmarks else 'NAO'}",
                 f"Mao dir: {'SIM' if results.right_hand_landmarks else 'NAO'}",
+                f"Coração: {'SIM 💖' if is_heart else 'NAO'}",
                 f"Status:  {status}",
             ])
 
@@ -203,10 +305,11 @@ class ControlPanel:
     BG2     = "#1a1a2e"
     ACCENT  = "#4f8ef7"
 
-    def __init__(self, root: tk.Tk, debug_win: "DebugWindow", alert_win: "AlertWindow"):
+    def __init__(self, root: tk.Tk, debug_win: "DebugWindow", alert_win: "AlertWindow", heart_win: "HeartOverlayWindow"):
         self.root      = root
         self.debug_win = debug_win
         self.alert_win = alert_win
+        self.heart_win = heart_win
 
         root.title("HandScanner")
         root.configure(bg=self.BG)
@@ -288,12 +391,16 @@ class ControlPanel:
         if shared["is_alert"]:
             self._dot.config(fg="#ff3333")
             self._status_lbl.config(text="ALERTA – Mão na boca!", fg="#ff5555")
+        elif shared["is_heart"]:
+            self._dot.config(fg="#ff33aa")
+            self._status_lbl.config(text="💖 Coração Detectado!", fg="#ff77cc")
         else:
             self._dot.config(fg="#44ff88")
             self._status_lbl.config(text="Monitorando...", fg="#aabbcc")
 
-        # Também gerencia a janela de alerta a partir daqui
+        # Também gerencia as janelas de overlay a partir daqui
         self.alert_win.update_visibility()
+        self.heart_win.update_visibility()
 
         self.root.after(100, self._poll)
 
@@ -352,6 +459,8 @@ class DebugWindow:
 
         if shared["is_alert"]:
             self._lbl.config(text="🔴 ALERTA – Mão na boca!", fg="#ff4444")
+        elif shared["is_heart"]:
+            self._lbl.config(text="💖 CORAÇÃO DETECTADO!", fg="#ff55cc")
         elif frame is not None:
             self._lbl.config(text="🟢 Monitorando...", fg="#44ff88")
 
@@ -398,6 +507,96 @@ class AlertWindow:
                 self._win.withdraw()
 
 
+# ─── Overlay de Coração Fullscreen ────────────────────────────────────────────
+
+class HeartOverlayWindow:
+    """Janela popup/overlay que exibe um coração gigante pulsante no centro da tela
+    quando o gesto de duas mãos em forma de coração é reconhecido."""
+
+    def __init__(self, root: tk.Tk):
+        win = tk.Toplevel(root)
+        win.title("Coração Detectado")
+        win.attributes("-fullscreen", True)
+        win.attributes("-topmost", True)
+        try:
+            win.attributes("-alpha", 0.85)
+        except Exception:
+            pass
+        win.configure(bg="#110515")
+
+        self.canvas = tk.Canvas(win, bg="#110515", highlightthickness=0)
+        self.canvas.pack(fill="both", expand=True)
+
+        win.withdraw()
+        self._win = win
+        self._anim_step = 0
+        self._is_animating = False
+
+    def update_visibility(self):
+        if shared["is_heart"]:
+            if self._win.state() == "withdrawn":
+                self._win.deiconify()
+                self._win.lift()
+                if not self._is_animating:
+                    self._is_animating = True
+                    self._animate()
+        else:
+            if self._win.state() == "normal":
+                self._is_animating = False
+                self._win.withdraw()
+
+    def _animate(self):
+        if not self._is_animating:
+            return
+
+        self.canvas.delete("all")
+        w = self.canvas.winfo_width() or 1280
+        h = self.canvas.winfo_height() or 720
+        cx, cy = w // 2, h // 2
+
+        self._anim_step += 0.12
+        pulse = 1.0 + 0.15 * math.sin(self._anim_step)
+        scale = (min(w, h) / 32.0) * pulse
+
+        # Desenha brilho externo do coração
+        pts_glow = []
+        steps = 80
+        scale_glow = scale * 1.2
+        for i in range(steps):
+            t = 2 * math.pi * i / steps
+            x = 16 * (math.sin(t) ** 3)
+            y = -(13 * math.cos(t) - 5 * math.cos(2*t) - 2 * math.cos(3*t) - math.cos(4*t))
+            pts_glow.extend([cx + x * scale_glow, cy + y * scale_glow])
+
+        # Desenha o coração principal
+        pts = []
+        for i in range(steps):
+            t = 2 * math.pi * i / steps
+            x = 16 * (math.sin(t) ** 3)
+            y = -(13 * math.cos(t) - 5 * math.cos(2*t) - 2 * math.cos(3*t) - math.cos(4*t))
+            pts.extend([cx + x * scale, cy + y * scale])
+
+        self.canvas.create_polygon(pts_glow, fill="#ff33aa", outline="")
+        self.canvas.create_polygon(pts, fill="#e6005c", outline="#ff99dd", width=4)
+
+        # Mensagem centralizada
+        self.canvas.create_text(
+            cx, cy + scale * 18,
+            text="💖 CORAÇÃO DETECTADO! 💖",
+            font=("Segoe UI", 32, "bold"),
+            fill="#ffffff"
+        )
+        self.canvas.create_text(
+            cx, cy + scale * 18 + 45,
+            text="Gesto reconhecido com sucesso!",
+            font=("Segoe UI", 16),
+            fill="#ffb3da"
+        )
+
+        if self._is_animating:
+            self._win.after(33, self._animate)
+
+
 # ─── Ponto de entrada ─────────────────────────────────────────────────────────
 
 def main():
@@ -407,8 +606,9 @@ def main():
     root = tk.Tk()
 
     alert_win = AlertWindow(root)
+    heart_win = HeartOverlayWindow(root)
     debug_win = DebugWindow(root)
-    panel     = ControlPanel(root, debug_win, alert_win)
+    panel     = ControlPanel(root, debug_win, alert_win, heart_win)
 
     root.mainloop()
 
