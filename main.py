@@ -24,10 +24,11 @@ FONT        = cv2.FONT_HERSHEY_SIMPLEX
 
 # ─── Estado compartilhado entre threads ───────────────────────────────────────
 shared = {
-    "is_alert": False,
-    "is_heart": False,
-    "frame":    None,
-    "lock":     threading.Lock(),
+    "is_alert":     False,
+    "is_heart":     False,
+    "enable_heart": True,
+    "frame":        None,
+    "lock":         threading.Lock(),
 }
 
 # ─── Helpers de desenho ────────────────────────────────────────────────────────
@@ -218,9 +219,16 @@ def vision_thread():
                 cv2.line(frame, mouth_px, close_tip_px, COLOR_TIP, 1)
 
             # ── Detecção de gesto: Coração com duas mãos ──────────────────────
-            is_heart, center_norm = detect_heart_gesture(
-                results.left_hand_landmarks, results.right_hand_landmarks
-            )
+            with shared["lock"]:
+                heart_enabled = shared["enable_heart"]
+
+            if heart_enabled:
+                is_heart, center_norm = detect_heart_gesture(
+                    results.left_hand_landmarks, results.right_hand_landmarks
+                )
+            else:
+                is_heart, center_norm = False, None
+
             shared["is_heart"] = is_heart
 
             if is_heart and center_norm:
@@ -285,7 +293,7 @@ def vision_thread():
                 f"Face:    {'SIM' if results.face_landmarks else 'NAO'}",
                 f"Mao esq: {'SIM' if results.left_hand_landmarks else 'NAO'}",
                 f"Mao dir: {'SIM' if results.right_hand_landmarks else 'NAO'}",
-                f"Coração: {'SIM 💖' if is_heart else 'NAO'}",
+                f"Coração: {'DESATIVADO' if not heart_enabled else ('SIM 💖' if is_heart else 'NAO')}",
                 f"Status:  {status}",
             ])
 
@@ -340,6 +348,21 @@ class ControlPanel:
         btn_frame = tk.Frame(root, bg=self.BG, pady=6)
         btn_frame.pack(fill="x", padx=14)
 
+        self._heart_var = tk.BooleanVar(value=shared["enable_heart"])
+        self._heart_cb = tk.Checkbutton(
+            btn_frame,
+            text="💖 Detecção de Coração",
+            variable=self._heart_var,
+            command=self._on_heart_toggle,
+            bg=self.BG, fg="#ddeeff",
+            selectcolor=self.BG2,
+            activebackground=self.BG,
+            activeforeground="#ddeeff",
+            font=("Segoe UI", 9),
+            cursor="hand2",
+        )
+        self._heart_cb.pack(fill="x", pady=(0, 6))
+
         self._debug_btn = tk.Button(
             btn_frame,
             text="🔍  Mostrar Debug",
@@ -373,6 +396,10 @@ class ControlPanel:
         self._poll()
 
     # ── Lógica dos botões ─────────────────────────────────────────────────────
+
+    def _on_heart_toggle(self):
+        with shared["lock"]:
+            shared["enable_heart"] = self._heart_var.get()
 
     def _toggle_debug(self):
         if self.debug_win.visible:
@@ -479,127 +506,260 @@ class DebugWindow:
         self._win.withdraw()
 
 
-# ─── Janela de alerta fullscreen ─────────────────────────────────────────────
+# ─── Detecção de Monitores ───────────────────────────────────────────────────
 
-class AlertWindow:
-    def __init__(self, root: tk.Tk):
-        win = tk.Toplevel(root)
-        win.title("ALERTA")
-        win.attributes("-fullscreen", True)
-        win.attributes("-topmost", True)
+def get_monitors_list(root=None):
+    """Retorna uma lista de dicionários com a geometria de cada monitor conectado:
+    [{'x': x, 'y': y, 'width': width, 'height': height}, ...]"""
+    # 1. Tenta usar a biblioteca screeninfo
+    try:
+        import screeninfo
+        m_list = screeninfo.get_monitors()
+        if m_list:
+            return [{'x': m.x, 'y': m.y, 'width': m.width, 'height': m.height} for m in m_list]
+    except Exception:
+        pass
+
+    # 2. Tenta usar o comando xrandr no Linux X11
+    try:
+        import subprocess
+        import re
+        output = subprocess.check_output(['xrandr', '--query'], stderr=subprocess.DEVNULL).decode('utf-8')
+        pattern = r'connected\s+(?:primary\s+)?(\d+)x(\d+)\+(\d+)\+(\d+)'
+        matches = re.findall(pattern, output)
+        if matches:
+            return [{'x': int(x), 'y': int(y), 'width': int(w), 'height': int(h)} for w, h, x, y in matches]
+    except Exception:
+        pass
+
+    # 3. Fallback: utiliza o tamanho total detectado pelo Tkinter
+    if root is not None:
         try:
-            win.attributes("-alpha", 0.88)
+            return [{'x': 0, 'y': 0, 'width': root.winfo_screenwidth(), 'height': root.winfo_screenheight()}]
         except Exception:
             pass
-        win.configure(bg="red")
-        tk.Label(win, text="TIRE A MÃO DA BOCA!",
-                 font=("Arial", 60, "bold"),
-                 fg="white", bg="red").pack(expand=True)
-        win.withdraw()
-        self._win = win
+
+    return [{'x': 0, 'y': 0, 'width': 1920, 'height': 1080}]
+
+
+# ─── Janela de alerta fullscreen (Multi-monitor) ─────────────────────────────
+
+class AlertWindow:
+    """Janela de alerta em tela cheia exibida em TODOS os monitores conectados."""
+
+    def __init__(self, root: tk.Tk):
+        self.root = root
+        self.wins = []
+        self._monitors_cache = None
+        self._check_counter = 0
+        self._setup_windows()
+
+    def _setup_windows(self):
+        for win in self.wins:
+            try:
+                win.destroy()
+            except Exception:
+                pass
+        self.wins = []
+
+        monitors = get_monitors_list(self.root)
+        self._monitors_cache = monitors
+
+        for m in monitors:
+            win = tk.Toplevel(self.root)
+            win.title("ALERTA")
+            win.geometry(f"{m['width']}x{m['height']}+{m['x']}+{m['y']}")
+            win.overrideredirect(True)
+            win.attributes("-topmost", True)
+            try:
+                win.attributes("-alpha", 0.88)
+            except Exception:
+                pass
+            win.configure(bg="red")
+
+            font_size = max(36, int(m["width"] / 25))
+            lbl = tk.Label(
+                win,
+                text="TIRE A MÃO DA BOCA!",
+                font=("Arial", font_size, "bold"),
+                fg="white",
+                bg="red",
+            )
+            lbl.pack(expand=True)
+
+            win.withdraw()
+            self.wins.append(win)
 
     def update_visibility(self):
+        self._check_counter += 1
+        if self._check_counter >= 30:  # Checa se a lista de monitores mudou a cada ~3s
+            self._check_counter = 0
+            current_monitors = get_monitors_list(self.root)
+            if current_monitors != self._monitors_cache:
+                self._setup_windows()
+
         if shared["is_alert"]:
-            if self._win.state() == "withdrawn":
-                self._win.deiconify()
+            for win in self.wins:
+                if win.state() == "withdrawn":
+                    win.deiconify()
+                    win.lift()
         else:
-            if self._win.state() == "normal":
-                self._win.withdraw()
+            for win in self.wins:
+                if win.state() == "normal":
+                    win.withdraw()
 
 
-# ─── Overlay de Coração Fullscreen ────────────────────────────────────────────
+# ─── Overlay de Coração Fullscreen (Multi-monitor) ───────────────────────────
 
 class HeartOverlayWindow:
-    """Janela popup/overlay que exibe um coração gigante pulsante no centro da tela
+    """Janela popup/overlay que exibe um coração gigante pulsante em TODOS os monitores conectados
     quando o gesto de duas mãos em forma de coração é reconhecido."""
 
     def __init__(self, root: tk.Tk):
-        win = tk.Toplevel(root)
-        win.title("Coração Detectado")
-        win.attributes("-fullscreen", True)
-        win.attributes("-topmost", True)
-        try:
-            win.attributes("-alpha", 0.85)
-        except Exception:
-            pass
-        win.configure(bg="#110515")
-
-        self.canvas = tk.Canvas(win, bg="#110515", highlightthickness=0)
-        self.canvas.pack(fill="both", expand=True)
-
-        win.withdraw()
-        self._win = win
+        self.root = root
+        self.wins = []
+        self.canvases = []
+        self._monitors_cache = None
+        self._check_counter = 0
         self._anim_step = 0
         self._is_animating = False
+        self._setup_windows()
+
+    def _setup_windows(self):
+        for win in self.wins:
+            try:
+                win.destroy()
+            except Exception:
+                pass
+        self.wins = []
+        self.canvases = []
+
+        monitors = get_monitors_list(self.root)
+        self._monitors_cache = monitors
+
+        for m in monitors:
+            win = tk.Toplevel(self.root)
+            win.title("Coração Detectado")
+            win.geometry(f"{m['width']}x{m['height']}+{m['x']}+{m['y']}")
+            win.overrideredirect(True)
+            win.attributes("-topmost", True)
+            try:
+                win.attributes("-alpha", 0.85)
+            except Exception:
+                pass
+            win.configure(bg="#110515")
+
+            canvas = tk.Canvas(win, bg="#110515", highlightthickness=0)
+            canvas.pack(fill="both", expand=True)
+
+            win.withdraw()
+            self.wins.append(win)
+            self.canvases.append(canvas)
 
     def update_visibility(self):
+        self._check_counter += 1
+        if self._check_counter >= 30:  # Checa se a lista de monitores mudou a cada ~3s
+            self._check_counter = 0
+            current_monitors = get_monitors_list(self.root)
+            if current_monitors != self._monitors_cache:
+                self._setup_windows()
+
         if shared["is_heart"]:
-            if self._win.state() == "withdrawn":
-                self._win.deiconify()
-                self._win.lift()
-                if not self._is_animating:
-                    self._is_animating = True
-                    self._animate()
+            showing = False
+            for win in self.wins:
+                if win.state() == "withdrawn":
+                    win.deiconify()
+                    win.lift()
+                    showing = True
+            if showing and not self._is_animating:
+                self._is_animating = True
+                self._animate()
         else:
-            if self._win.state() == "normal":
+            if any(w.state() == "normal" for w in self.wins):
                 self._is_animating = False
-                self._win.withdraw()
+                for win in self.wins:
+                    win.withdraw()
 
     def _animate(self):
         if not self._is_animating:
             return
 
-        self.canvas.delete("all")
-        w = self.canvas.winfo_width() or 1280
-        h = self.canvas.winfo_height() or 720
-        cx, cy = w // 2, h // 2
-
         self._anim_step += 0.12
         pulse = 1.0 + 0.15 * math.sin(self._anim_step)
-        scale = (min(w, h) / 32.0) * pulse
-
-        # Desenha brilho externo do coração
-        pts_glow = []
         steps = 80
-        scale_glow = scale * 1.2
-        for i in range(steps):
-            t = 2 * math.pi * i / steps
-            x = 16 * (math.sin(t) ** 3)
-            y = -(13 * math.cos(t) - 5 * math.cos(2*t) - 2 * math.cos(3*t) - math.cos(4*t))
-            pts_glow.extend([cx + x * scale_glow, cy + y * scale_glow])
 
-        # Desenha o coração principal
-        pts = []
-        for i in range(steps):
-            t = 2 * math.pi * i / steps
-            x = 16 * (math.sin(t) ** 3)
-            y = -(13 * math.cos(t) - 5 * math.cos(2*t) - 2 * math.cos(3*t) - math.cos(4*t))
-            pts.extend([cx + x * scale, cy + y * scale])
+        for i, canvas in enumerate(self.canvases):
+            canvas.delete("all")
+            m = self._monitors_cache[i] if i < len(self._monitors_cache) else {'width': 1920, 'height': 1080}
+            w = canvas.winfo_width() or m['width']
+            h = canvas.winfo_height() or m['height']
+            cx, cy = w // 2, h // 2
+            scale = (min(w, h) / 32.0) * pulse
 
-        self.canvas.create_polygon(pts_glow, fill="#ff33aa", outline="")
-        self.canvas.create_polygon(pts, fill="#e6005c", outline="#ff99dd", width=4)
+            # Glow externo
+            scale_glow = scale * 1.2
+            pts_glow = []
+            for s in range(steps):
+                t = 2 * math.pi * s / steps
+                x = 16 * (math.sin(t) ** 3)
+                y = -(13 * math.cos(t) - 5 * math.cos(2*t) - 2 * math.cos(3*t) - math.cos(4*t))
+                pts_glow.extend([cx + x * scale_glow, cy + y * scale_glow])
 
-        # Mensagem centralizada
-        self.canvas.create_text(
-            cx, cy + scale * 18,
-            text="💖 CORAÇÃO DETECTADO! 💖",
-            font=("Segoe UI", 32, "bold"),
-            fill="#ffffff"
-        )
-        self.canvas.create_text(
-            cx, cy + scale * 18 + 45,
-            text="Gesto reconhecido com sucesso!",
-            font=("Segoe UI", 16),
-            fill="#ffb3da"
-        )
+            # Coração principal
+            pts = []
+            for s in range(steps):
+                t = 2 * math.pi * s / steps
+                x = 16 * (math.sin(t) ** 3)
+                y = -(13 * math.cos(t) - 5 * math.cos(2*t) - 2 * math.cos(3*t) - math.cos(4*t))
+                pts.extend([cx + x * scale, cy + y * scale])
+
+            canvas.create_polygon(pts_glow, fill="#ff33aa", outline="")
+            canvas.create_polygon(pts, fill="#e6005c", outline="#ff99dd", width=4)
+
+            font_title_size = max(20, int(w / 40))
+            font_sub_size = max(12, int(w / 80))
+
+            canvas.create_text(
+                cx, cy + scale * 18,
+                text="💖 CORAÇÃO DETECTADO! 💖",
+                font=("Segoe UI", font_title_size, "bold"),
+                fill="#ffffff"
+            )
+            canvas.create_text(
+                cx, cy + scale * 18 + int(font_title_size * 1.4),
+                text="Gesto reconhecido com sucesso!",
+                font=("Segoe UI", font_sub_size),
+                fill="#ffb3da"
+            )
 
         if self._is_animating:
-            self._win.after(33, self._animate)
+            self.root.after(33, self._animate)
+
 
 
 # ─── Ponto de entrada ─────────────────────────────────────────────────────────
 
 def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="HandScanner - Monitoramento e detecção de gestos")
+    parser.add_argument(
+        "--no-heart", "--disable-heart",
+        dest="enable_heart",
+        action="store_false",
+        default=True,
+        help="Desativa a detecção do gesto de coração"
+    )
+    parser.add_argument(
+        "--heart", "--enable-heart",
+        dest="enable_heart",
+        action="store_true",
+        help="Ativa a detecção do gesto de coração (padrão: ativo)"
+    )
+    args = parser.parse_args()
+
+    with shared["lock"]:
+        shared["enable_heart"] = args.enable_heart
+
     t = threading.Thread(target=vision_thread, daemon=True)
     t.start()
 

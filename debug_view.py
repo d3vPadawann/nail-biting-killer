@@ -149,7 +149,7 @@ def draw_giant_heart(img, center_px, now):
 
 # ─── Loop principal ────────────────────────────────────────────────────────────
 
-def run_debug_view():
+def run_debug_view(enable_heart: bool = True):
     cap = cv2.VideoCapture(0)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
@@ -241,9 +241,12 @@ def run_debug_view():
                     cv2.line(frame, mouth_px, close_finger_px, COLOR_FINGER_TIP, 1)
 
             # ── Detecção do gesto de coração com duas mãos ────────────────────
-            is_heart, center_norm = detect_heart_gesture(
-                results.left_hand_landmarks, results.right_hand_landmarks
-            )
+            if enable_heart:
+                is_heart, center_norm = detect_heart_gesture(
+                    results.left_hand_landmarks, results.right_hand_landmarks
+                )
+            else:
+                is_heart, center_norm = False, None
 
             if is_heart and center_norm:
                 cx_px = int(center_norm[0] * w)
@@ -293,7 +296,7 @@ def run_debug_view():
                 f"Face: {'SIM' if results.face_landmarks else 'NAO'}",
                 f"Mao esq: {'SIM' if results.left_hand_landmarks else 'NAO'}",
                 f"Mao dir: {'SIM' if results.right_hand_landmarks else 'NAO'}",
-                f"Coração: {'SIM 💖' if is_heart else 'NAO'}",
+                f"Coração: {'DESATIVADO' if not enable_heart else ('SIM 💖' if is_heart else 'NAO')}",
                 f"Status: {status_str}",
             ])
 
@@ -327,4 +330,20 @@ def run_debug_view():
 
 
 if __name__ == "__main__":
-    run_debug_view()
+    import argparse
+    parser = argparse.ArgumentParser(description="HandScanner Debug View")
+    parser.add_argument(
+        "--no-heart", "--disable-heart",
+        dest="enable_heart",
+        action="store_false",
+        default=True,
+        help="Desativa a detecção do gesto de coração"
+    )
+    parser.add_argument(
+        "--heart", "--enable-heart",
+        dest="enable_heart",
+        action="store_true",
+        help="Ativa a detecção do gesto de coração"
+    )
+    args = parser.parse_args()
+    run_debug_view(enable_heart=args.enable_heart)
